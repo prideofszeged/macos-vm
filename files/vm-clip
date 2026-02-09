@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+
+# vm-clip: Seamless clipboard sharing between Linux host and macOS VM
+#
+# Usage:
+#   vm-clip sync     Start background clipboard sync (bidirectional)
+#   vm-clip push     One-shot: host clipboard → VM
+#   vm-clip pull     One-shot: VM clipboard → host
+#   vm-clip stop     Stop the background sync daemon
+#   vm-clip status   Check if sync is running
+
+set -euo pipefail
+
+VM_SSH_PORT="${VM_CLIP_PORT:-2222}"
+VM_SSH_USER="${VM_CLIP_USER:-$(whoami)}"
+VM_SSH_HOST="${VM_CLIP_HOST:-localhost}"
+POLL_INTERVAL="${VM_CLIP_INTERVAL:-0.5}"
+
+PIDFILE="${XDG_RUNTIME_DIR:-/tmp}/vm-clip.pid"
+SSH_SOCKET="${XDG_RUNTIME_DIR:-/tmp}/vm-clip-ssh.sock"
+
+# --- SSH with persistent connection ---
+
+ssh_cmd() {
+    ssh -p "$VM_SSH_PORT" \
+        -o ControlMaster=auto \
+        -o ControlPath="$SSH_SOCKET" \
+        -o ControlPersist=600 \
+        -o ConnectTimeout=2 \
+        -o BatchMode=yes \
+        -o StrictHostKeyChecking=accept-new \
+        "$VM_SSH_USER@$VM_SSH_HOST" "$@"
+}
+
+ensure_connection() {
+    if ! ssh_cmd true 2>/dev/null; then
+        echo "Cannot reach macOS VM at $VM_SSH_HOST:$VM_SSH_PORT"
+        echo ""
+        echo "Make sure:"
+        echo "  1. The VM is running"
+        echo "  2. SSH is enabled in macOS (System Settings > General > Sharing > Remote Login)"
+        echo "  3. You've connected at least once: ssh -p $VM_SSH_PORT $VM_SSH_USER@$VM_SSH_HOST"
+        exit 1
+    fi
+}
+
+# --- Clipboard operations ---
+
+host_clipboard_get() {
+    if command -v xclip &>/dev/null; then
+        xclip -selection clipboard -o 2>/dev/null || true
+    elif command -v xsel &>/dev/null; then
+        xsel --clipboard --output 2>/dev/null || true
+    elif command -v wl-paste &>/dev/null; then
+        wl-paste 2>/dev/null || true
+    else
+        echo "No clipboard tool found. Install xclip, xsel, or wl-clipboard." >&2
+        exit 1
+    fi
+}
+
+host_clipboard_set() {
+    if command -v xclip &>/dev/null; then
+        xclip -selection clipboard 2>/dev/null
+    elif command -v xsel &>/dev/null; then
+        xsel --clipboard --input 2>/dev/null
+    elif command -v wl-copy &>/dev/null; then
+        wl-copy 2>/dev/null
+    fi
+}
+
+vm_clipboard_get() {
+    ssh_cmd "pbpaste" 2>/dev/null || true
+}
+
+vm_clipboard_set() {
+    ssh_cmd "pbcopy" 2>/dev/null
+}
+
+# --- Commands ---
+
+do_push() {
+    local content
+    content="$(host_clipboard_get)"
+    if [[ -n "$content" ]]; then
+        printf '%s' "$content" | vm_clipboard_set
+    fi
+}
+
+do_pull() {
+    local content
+    content="$(vm_clipboard_get)"
+    if [[ -n "$content" ]]; then
+        printf '%s' "$content" | host_clipboard_set
+    fi
+}
+
+do_sync() {
+    if is_running; then
+        echo "Clipboard sync is already running (PID: $(cat "$PIDFILE"))"
+        exit 0
+    fi
+
+    ensure_connection
+    echo "Starting clipboard sync (host ↔ macOS VM)"
+    echo "  VM: $VM_SSH_USER@$VM_SSH_HOST:$VM_SSH_PORT"
+    echo "  Poll interval: ${POLL_INTERVAL}s"
+
+    # Daemonize
+    _run_sync_loop &
+    local pid=$!
+    echo "$pid" > "$PIDFILE"
+    disown "$pid"
+    echo "  PID: $pid"
+    echo ""
+    echo "Clipboard is now shared. Copy on either side, paste on either side."
+    echo "Run 'vm-clip stop' to stop."
+}
+
+_run_sync_loop() {
+    local last_host="" last_vm="" current_host current_vm
+
+    # Get initial state
+    last_host="$(host_clipboard_get)"
+    last_vm="$(vm_clipboard_get)"
+
+    while true; do
+        # Check host clipboard changed
+        current_host="$(host_clipboard_get)"
+        if [[ "$current_host" != "$last_host" ]] && [[ -n "$current_host" ]]; then
+            printf '%s' "$current_host" | vm_clipboard_set
+            last_host="$current_host"
+            last_vm="$current_host"
+        fi
+
+        # Check VM clipboard changed
+        current_vm="$(vm_clipboard_get)"
+        if [[ "$current_vm" != "$last_vm" ]] && [[ -n "$current_vm" ]]; then
+            printf '%s' "$current_vm" | host_clipboard_set
+            last_vm="$current_vm"
+            last_host="$current_vm"
+        fi
+
+        sleep "$POLL_INTERVAL"
+    done
+}
+
+do_stop() {
+    if ! is_running; then
+        echo "Clipboard sync is not running"
+        rm -f "$PIDFILE"
+        return
+    fi
+
+    local pid
+    pid=$(cat "$PIDFILE")
+    kill "$pid" 2>/dev/null
+    rm -f "$PIDFILE"
+
+    # Close SSH control connection
+    ssh -O exit -o ControlPath="$SSH_SOCKET" "$VM_SSH_USER@$VM_SSH_HOST" 2>/dev/null || true
+
+    echo "Clipboard sync stopped"
+}
+
+is_running() {
+    [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null
+}
+
+do_status() {
+    if is_running; then
+        echo "Clipboard sync is running (PID: $(cat "$PIDFILE"))"
+    else
+        echo "Clipboard sync is not running"
+        rm -f "$PIDFILE"
+    fi
+}
+
+# --- Main ---
+
+case "${1:-}" in
+    push)   ensure_connection; do_push;   echo "Host → VM clipboard synced" ;;
+    pull)   ensure_connection; do_pull;   echo "VM → Host clipboard synced" ;;
+    sync)   do_sync ;;
+    stop)   do_stop ;;
+    status) do_status ;;
+    *)
+        echo "Usage: vm-clip {sync|push|pull|stop|status}"
+        echo ""
+        echo "  sync     Continuous bidirectional clipboard sharing"
+        echo "  push     Copy host clipboard to VM (one-shot)"
+        echo "  pull     Copy VM clipboard to host (one-shot)"
+        echo "  stop     Stop background sync"
+        echo "  status   Check if sync is running"
+        echo ""
+        echo "Environment variables:"
+        echo "  VM_CLIP_PORT=2222      SSH port"
+        echo "  VM_CLIP_USER=\$USER    SSH user"
+        echo "  VM_CLIP_HOST=localhost SSH host"
+        echo "  VM_CLIP_INTERVAL=0.5  Poll interval in seconds"
+        ;;
+esac

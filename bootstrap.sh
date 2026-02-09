@@ -64,6 +64,13 @@ cp "$SCRIPT_DIR/files/macos-launcher.sh" "$TARGET_DIR/macos-launcher.sh"
 cp "$SCRIPT_DIR/files/kvm-macos.conf" "$TARGET_DIR/kvm-macos.conf"
 chmod +x "$TARGET_DIR/setup.sh" "$TARGET_DIR/macos-launcher.sh"
 echo "  Copied: setup.sh, macos-launcher.sh, kvm-macos.conf"
+
+# Install vm-clip to PATH
+if [[ -d "$HOME/.local/bin" ]] || mkdir -p "$HOME/.local/bin"; then
+    cp "$SCRIPT_DIR/files/vm-clip" "$HOME/.local/bin/vm-clip"
+    chmod +x "$HOME/.local/bin/vm-clip"
+    echo "  Installed: vm-clip → ~/.local/bin/vm-clip"
+fi
 echo ""
 
 # Step 4: Run setup (optional)
@@ -89,6 +96,9 @@ echo ""
 echo "Next steps:"
 echo "  cd $TARGET_DIR"
 echo "  ./macos-launcher.sh        # Start the VM"
+echo ""
+echo "Clipboard sharing (after SSH is set up):"
+echo "  vm-clip sync               # Bidirectional, runs in background"
 echo ""
 echo "SSH into the VM (after macOS is installed + SSH enabled):"
 echo "  ssh -p 2222 user@localhost"
