@@ -12,6 +12,7 @@ graph TB
         SETUP[files/setup.sh]
         LAUNCHER[files/macos-launcher.sh]
         KVMCONF[files/kvm-macos.conf]
+        VMCLIP[files/vm-clip]
     end
 
     subgraph "Upstream (kholia/OSX-KVM)"
@@ -39,12 +40,16 @@ graph TB
     SETUP -->|copied to| SETUP2
     LAUNCHER -->|copied to| LAUNCHER2
     BS -->|"4. runs"| SETUP2
+    BS -->|"3. install"| VMCLIP
+    VMCLIP -->|installed to| VMCLIP2["~/.local/bin/vm-clip"]
 
     style BS fill:#4a9eff,color:#fff
     style PATCH fill:#ff6b6b,color:#fff
     style OC fill:#51cf66,color:#fff
     style SETUP2 fill:#ffd43b,color:#000
     style LAUNCHER2 fill:#ffd43b,color:#000
+    style VMCLIP fill:#b197fc,color:#fff
+    style VMCLIP2 fill:#b197fc,color:#fff
 ```
 
 ## Bootstrap Flow
@@ -244,6 +249,68 @@ graph LR
     style MAC fill:#51cf66,color:#fff
 ```
 
+## Clipboard Sharing: vm-clip
+
+`vm-clip` provides seamless bidirectional clipboard sync between the Linux host and macOS VM. No special agent needed on the macOS side — it uses `pbcopy`/`pbpaste` over SSH.
+
+### How It Works
+
+```mermaid
+sequenceDiagram
+    participant HC as Linux Clipboard<br>(xclip)
+    participant LOOP as vm-clip<br>(bash loop)
+    participant SSH as SSH ControlMaster<br>(persistent connection)
+    participant MC as macOS Clipboard<br>(pbcopy/pbpaste)
+
+    Note over LOOP: Polls every 500ms
+
+    loop Every 500ms
+        LOOP->>HC: Read host clipboard (xclip -o)
+        LOOP->>SSH: Read VM clipboard (pbpaste)
+        SSH->>MC: pbpaste
+        MC-->>SSH: "current text"
+        SSH-->>LOOP: "current text"
+
+        alt Host clipboard changed
+            LOOP->>SSH: Write to VM (pbcopy)
+            SSH->>MC: pbcopy
+            Note over MC: Cmd+V now has<br>the Linux text
+        else VM clipboard changed
+            LOOP->>HC: Write to host (xclip)
+            Note over HC: Ctrl+V now has<br>the macOS text
+        end
+    end
+```
+
+### Why It Feels Instant
+
+```mermaid
+graph LR
+    subgraph "Without ControlMaster"
+        A1["Poll 1:<br>TCP handshake<br>SSH handshake<br>pbpaste<br>~200ms"] --> A2["Poll 2:<br>TCP handshake<br>SSH handshake<br>pbpaste<br>~200ms"]
+    end
+
+    subgraph "With ControlMaster (what vm-clip uses)"
+        B1["Poll 1:<br>SSH handshake<br>(first time only)<br>pbpaste<br>~200ms"] --> B2["Poll 2:<br>reuse socket<br>pbpaste<br>~5ms"] --> B3["Poll 3:<br>reuse socket<br>pbpaste<br>~5ms"]
+    end
+
+    style A1 fill:#ff6b6b,color:#fff
+    style A2 fill:#ff6b6b,color:#fff
+    style B1 fill:#ffd43b,color:#000
+    style B2 fill:#51cf66,color:#fff
+    style B3 fill:#51cf66,color:#fff
+```
+
+### Commands
+
+| Command | What it does |
+|---------|-------------|
+| `vm-clip sync` | Start background daemon — copies flow both directions automatically |
+| `vm-clip push` | One-shot: host clipboard → VM |
+| `vm-clip pull` | One-shot: VM clipboard → host |
+| `vm-clip stop` | Kill the background sync |
+| `vm-clip status` | Check if sync is running |
+
 ## Why Not Just Fork?
 
 ```mermaid
@@ -275,7 +342,12 @@ graph TD
     BS -->|copies| SETUP[files/setup.sh]
     BS -->|copies| LAUNCHER[files/macos-launcher.sh]
     BS -->|copies| KVMCONF[files/kvm-macos.conf]
+    BS -->|installs| VMCLIP[files/vm-clip]
     BS -->|runs| SETUP
+
+    VMCLIP -->|installed to| VMCLIPBIN["~/.local/bin/<br>vm-clip"]
+    VMCLIPBIN -->|"xclip"| HOSTCLIP["Linux clipboard"]
+    VMCLIPBIN -->|"SSH → pbcopy/<br>pbpaste"| VMCLIPBOARD["macOS clipboard"]
 
     PATCH -->|modifies| OCBOOT["OSX-KVM/<br>OpenCore-Boot.sh"]
 
@@ -300,6 +372,8 @@ graph TD
     style QEMU fill:#51cf66,color:#fff
     style LAUNCHER fill:#ffd43b,color:#000
     style SETUP fill:#ffd43b,color:#000
+    style VMCLIP fill:#b197fc,color:#fff
+    style VMCLIPBIN fill:#b197fc,color:#fff
 ```
 
 ## Summary
@@ -310,5 +384,6 @@ graph TD
 | **Upstream clone** | The full OSX-KVM toolkit (OpenCore, OVMF, scripts) | Cloned into `OSX-KVM/` at bootstrap time |
 | **System config** | Kernel module params for KVM | `/etc/modprobe.d/kvm-macos.conf` |
 | **Runtime** | QEMU process running macOS | `qemu-system-x86_64` launched by `macos-launcher.sh` |
+| **Clipboard** | Bidirectional sync over SSH | `vm-clip sync` (polls xclip + pbcopy/pbpaste) |
 
 The key insight: you only version-control **your changes** (the patch + helper scripts), not the entire upstream project. When upstream updates, you re-run bootstrap and the patch applies on top of the latest code.
